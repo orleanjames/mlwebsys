@@ -19,6 +19,8 @@ export default function PointOfSalesPage({
   const [posView, setPosView] = useState('menu');
   const [activeModal, setActiveModal] = useState(null);
   const [selectedLogIndex, setSelectedLogIndex] = useState(null);
+  const [alertMessage, setAlertMessage] = useState('');
+  const [isNameLocked, setIsNameLocked] = useState(false);
 
   // Dropdown open states
   const [isSuppDropdownOpen, setIsSuppDropdownOpen] = useState(false);
@@ -35,6 +37,7 @@ export default function PointOfSalesPage({
         setActiveModal('open-shift-first');
       } else {
         if (initialModal === 'avail-membership') {
+          setIsNameLocked(false);
           setPosView('avail-membership');
         } else {
           setActiveModal(initialModal);
@@ -47,7 +50,8 @@ export default function PointOfSalesPage({
 
   // Forms State
   const [customerForm, setCustomerForm] = useState({ 
-    fullName: '', 
+    firstName: '', 
+    lastName: '',
     water: 'NO', 
     supplements: [], 
     classification: 'NON-MEMBER', 
@@ -56,13 +60,11 @@ export default function PointOfSalesPage({
     paymentMethod: 'CASH'
   });
   
-  const [isCustomerSelected, setIsCustomerSelected] = useState(false);
-  const [isMonthlySelected, setIsMonthlySelected] = useState(false);
-  const [isMembershipSelected, setIsMembershipSelected] = useState(false);
-
+  const [isCustomerSynced, setIsCustomerSynced] = useState(false);
   const [suggestions, setSuggestions] = useState([]);
   const [monthlySuggestions, setMonthlySuggestions] = useState([]);
   const [membershipSuggestions, setMembershipSuggestions] = useState([]);
+  const [isMonthlySelected, setIsMonthlySelected] = useState(false);
 
   const [monthlyForm, setMonthlyForm] = useState({ 
     firstName: '', lastName: '', contact: '', classification: 'NON-MEMBER', customerType: 'REGULAR', dateAdded: new Date().toISOString().split('T')[0], durationMonths: 1, paymentMethod: 'CASH'
@@ -97,46 +99,120 @@ export default function PointOfSalesPage({
     }
   };
 
-  // LOG A CUSTOMER AUTOCOMPLETE
-  const handleNameInputChange = (val) => {
-    setCustomerForm((prev) => ({ 
-      ...prev, 
-      fullName: val,
-    }));
-    setIsCustomerSelected(false);
+  // HELPER TO CHECK IF A NAME HAS AN ACTIVE MONTHLY PASS
+  const checkActiveMonthlyPass = (nameQuery) => {
+    const uppercaseName = nameQuery.toUpperCase();
+    const monthlyHoldersMap = new Map();
+    const sortedLogsForMonthly = [...allDatabaseLogs, ...checkInLogs].sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
 
-    if (!val.trim()) {
-      setSuggestions([]);
-      return;
-    }
+    sortedLogsForMonthly.forEach((log) => {
+      if ((log.passType || '').toUpperCase().includes('MONTHLY')) {
+        const logName = log.name.toUpperCase();
+        const passDate = log.date || '2026-10-18';
+        const monthsToAdd = parseInt(log.durationMonths || 1, 10);
+        const daysToAdd = monthsToAdd * 30;
 
-    const query = val.toUpperCase();
-    const matchedMap = new Map();
-
-    allDatabaseLogs.forEach((log) => {
-      if (log.name.toUpperCase().includes(query)) {
-        const existingPassType = log.passType || 'DAILY PASS';
-        const existingClassification = log.classification || 'NON-MEMBER';
-        const existingCustomerType = log.type || 'REGULAR';
-
-        if (!matchedMap.has(log.name.toUpperCase())) {
-          matchedMap.set(log.name.toUpperCase(), {
-            name: log.name.toUpperCase(),
-            classification: existingClassification,
-            passType: existingPassType,
-            customerType: existingCustomerType,
-          });
+        if (!monthlyHoldersMap.has(logName)) {
+          const startDateObj = new Date(passDate);
+          startDateObj.setDate(startDateObj.getDate() + daysToAdd);
+          monthlyHoldersMap.set(logName, startDateObj.toISOString().split('T')[0]);
+        } else {
+          const existingEndDate = monthlyHoldersMap.get(logName);
+          const baseDate = new Date(existingEndDate > passDate ? existingEndDate : passDate);
+          baseDate.setDate(baseDate.getDate() + daysToAdd);
+          monthlyHoldersMap.set(logName, baseDate.toISOString().split('T')[0]);
         }
       }
     });
 
+    const endDate = monthlyHoldersMap.get(uppercaseName);
+    if (endDate && new Date(endDate) >= new Date()) {
+      return true;
+    }
+    return false;
+  };
+
+  const isAlreadyMember = (nameQuery) => {
+    const uppercaseName = nameQuery.toUpperCase().trim();
+    const inMembers = members.some((m) => m.name.toUpperCase() === uppercaseName);
+    const inLogs = [...allDatabaseLogs, ...checkInLogs].some((l) => l.name.toUpperCase() === uppercaseName && l.passType === 'MEMBERSHIP AVAIL');
+    return inMembers || inLogs;
+  };
+
+  // LOG A CUSTOMER AUTOCOMPLETE & REAL-TIME SYNC
+  const handleCustomerNameInput = (val, isFirstName = true) => {
+    const updatedFirstName = isFirstName ? val : customerForm.firstName;
+    const updatedLastName = isFirstName ? customerForm.lastName : val;
+    const searchStr = `${updatedFirstName} ${updatedLastName}`.trim();
+    const query = searchStr.toUpperCase();
+    
+    let inferredClassification = 'NON-MEMBER';
+    let inferredPassType = 'DAILY PASS';
+    let inferredCustomerType = customerForm.customerType;
+    let foundInDb = false;
+
+    if (query) {
+      const isMember = members.some((m) => m.name.toUpperCase() === query);
+      if (isMember) {
+        inferredClassification = 'MEMBER';
+        foundInDb = true;
+      }
+
+      if (checkActiveMonthlyPass(query)) {
+        inferredPassType = 'MONTHLY PASS';
+        foundInDb = true;
+      }
+
+      // Check recent logs for auto-syncing student status / classification
+      const allCombinedLogs = [...checkInLogs, ...allDatabaseLogs];
+      const matchedLog = allCombinedLogs.slice().reverse().find((l) => l.name.toUpperCase() === query);
+      if (matchedLog) {
+        foundInDb = true;
+        if (matchedLog.classification) inferredClassification = matchedLog.classification;
+        if (matchedLog.type) inferredCustomerType = matchedLog.type;
+        if (matchedLog.passType && !checkActiveMonthlyPass(query)) inferredPassType = matchedLog.passType;
+      }
+    }
+
+    setIsCustomerSynced(foundInDb);
+
+    setCustomerForm((prev) => ({ 
+      ...prev, 
+      firstName: updatedFirstName,
+      lastName: updatedLastName,
+      classification: inferredClassification,
+      passType: inferredPassType,
+      customerType: foundInDb ? inferredCustomerType : prev.customerType,
+    }));
+
+    if (!searchStr) {
+      setSuggestions([]);
+      return;
+    }
+
+    const matchedMap = new Map();
+
     members.forEach((m) => {
-      if (m.name.toUpperCase().includes(query) && !matchedMap.has(m.name.toUpperCase())) {
+      if (m.name.toUpperCase().includes(query)) {
+        const hasMonthly = checkActiveMonthlyPass(m.name);
         matchedMap.set(m.name.toUpperCase(), {
           name: m.name.toUpperCase(),
           classification: 'MEMBER',
-          passType: 'DAILY PASS',
+          passType: hasMonthly ? 'MONTHLY PASS' : 'DAILY PASS',
           customerType: 'REGULAR',
+        });
+      }
+    });
+
+    allDatabaseLogs.concat(checkInLogs).forEach((log) => {
+      if (log.name.toUpperCase().includes(query) && !matchedMap.has(log.name.toUpperCase())) {
+        const isMember = members.some((m) => m.name.toUpperCase() === log.name.toUpperCase());
+        const hasMonthly = checkActiveMonthlyPass(log.name);
+        matchedMap.set(log.name.toUpperCase(), {
+          name: log.name.toUpperCase(),
+          classification: isMember ? 'MEMBER' : (log.classification || 'NON-MEMBER'),
+          passType: hasMonthly ? 'MONTHLY PASS' : (log.passType || 'DAILY PASS'),
+          customerType: log.type || 'REGULAR',
         });
       }
     });
@@ -145,8 +221,14 @@ export default function PointOfSalesPage({
   };
 
   const handleSelectCustomer = (person) => {
+    const nameParts = person.name.trim().split(' ');
+    const lastName = nameParts.length > 1 ? nameParts.pop() : '';
+    const firstName = nameParts.join(' ');
+
+    setIsCustomerSynced(true);
     setCustomerForm({
-      fullName: person.name,
+      firstName: firstName || person.name,
+      lastName: lastName,
       water: 'NO',
       supplements: [],
       classification: person.classification,
@@ -154,12 +236,12 @@ export default function PointOfSalesPage({
       customerType: person.customerType,
       paymentMethod: 'CASH'
     });
-    setIsCustomerSelected(true);
     setSuggestions([]);
   };
 
   // MONTHLY PASS AUTOCOMPLETE
   const handleMonthlyNameInput = (val, isFirstName = true) => {
+    if (isNameLocked) return; // Prevent changing if locked from edit modal
     const updatedFirstName = isFirstName ? val : monthlyForm.firstName;
     const updatedLastName = isFirstName ? monthlyForm.lastName : val;
 
@@ -190,12 +272,13 @@ export default function PointOfSalesPage({
       }
     });
 
-    allDatabaseLogs.forEach((log) => {
+    allDatabaseLogs.concat(checkInLogs).forEach((log) => {
       if (log.name.toUpperCase().includes(query) && !matchedMap.has(log.name.toUpperCase())) {
+        const isMember = members.some((m) => m.name.toUpperCase() === log.name.toUpperCase());
         matchedMap.set(log.name.toUpperCase(), {
           name: log.name.toUpperCase(),
           contact: '',
-          classification: log.classification || 'NON-MEMBER',
+          classification: isMember ? 'MEMBER' : (log.classification || 'NON-MEMBER'),
           customerType: log.type || 'REGULAR',
         });
       }
@@ -205,6 +288,7 @@ export default function PointOfSalesPage({
   };
 
   const handleSelectMonthlyPerson = (person) => {
+    if (isNameLocked) return;
     const nameParts = person.name.trim().split(' ');
     const lastName = nameParts.length > 1 ? nameParts.pop() : '';
     const firstName = nameParts.join(' ');
@@ -221,8 +305,9 @@ export default function PointOfSalesPage({
     setMonthlySuggestions([]);
   };
 
-  // AVAIL MEMBERSHIP AUTOCOMPLETE (EXCLUDES EXISTING MEMBERS)
+  // AVAIL MEMBERSHIP AUTOCOMPLETE
   const handleMembershipNameInput = (val, isFirstName = true) => {
+    if (isNameLocked) return; // Prevent changing if locked from edit modal
     const updatedFirstName = isFirstName ? val : membershipForm.firstName;
     const updatedLastName = isFirstName ? membershipForm.lastName : val;
 
@@ -231,7 +316,6 @@ export default function PointOfSalesPage({
       firstName: updatedFirstName,
       lastName: updatedLastName,
     }));
-    setIsMembershipSelected(false);
 
     const searchStr = `${updatedFirstName} ${updatedLastName}`.trim();
     if (!searchStr) {
@@ -241,18 +325,13 @@ export default function PointOfSalesPage({
 
     const query = searchStr.toUpperCase();
     const matchedMap = new Map();
-
-    // Create a Set of existing member names for fast lookup & exclusion
     const existingMemberNames = new Set(members.map((m) => m.name.toUpperCase()));
 
-    allDatabaseLogs.forEach((log) => {
+    allDatabaseLogs.concat(checkInLogs).forEach((log) => {
       const logName = log.name.toUpperCase();
-      // Exclude if already registered in the official members list
       if (logName.includes(query) && !existingMemberNames.has(logName)) {
         if (!matchedMap.has(logName)) {
-          matchedMap.set(logName, {
-            name: logName,
-          });
+          matchedMap.set(logName, { name: logName });
         }
       }
     });
@@ -261,6 +340,7 @@ export default function PointOfSalesPage({
   };
 
   const handleSelectMembershipPerson = (person) => {
+    if (isNameLocked) return;
     const nameParts = person.name.trim().split(' ');
     const lastName = nameParts.length > 1 ? nameParts.pop() : '';
     const firstName = nameParts.join(' ');
@@ -270,15 +350,75 @@ export default function PointOfSalesPage({
       firstName: firstName || person.name,
       lastName: lastName,
     }));
-    setIsMembershipSelected(true);
     setMembershipSuggestions([]);
   };
 
-  const calculateDailyTotal = (water, supplements, passType, customerType, classification) => {
+  // Helper to trigger Avail Membership from Edit Modal with Pre-filled Data & Locked Name
+  const handleAvailMembershipFromEditModal = (customerName) => {
+    if (isAlreadyMember(customerName)) {
+      setAlertMessage(`${customerName} is already a member!`);
+      setActiveModal('custom-alert');
+      return;
+    }
+
+    const nameParts = customerName.trim().split(' ');
+    const lastName = nameParts.length > 1 ? nameParts.pop() : '';
+    const firstName = nameParts.join(' ');
+
+    setMembershipForm({
+      firstName: firstName || customerName,
+      lastName: lastName,
+      age: '',
+      sex: 'M',
+      contact: '',
+      address: '',
+      dateAdded: new Date().toISOString().split('T')[0],
+      fee: '500.00',
+      paymentMethod: 'CASH',
+    });
+
+    setIsNameLocked(true);
+    setActiveModal(null);
+    setPosView('avail-membership');
+  };
+
+  // Helper to trigger Avail Monthly Pass from Edit Modal with Pre-filled Data & Locked Name
+  const handleAvailMonthlyPassFromEditModal = (customerName) => {
+    const nameParts = customerName.trim().split(' ');
+    const lastName = nameParts.length > 1 ? nameParts.pop() : '';
+    const firstName = nameParts.join(' ');
+
+    const matchedLog = [...checkInLogs, ...allDatabaseLogs].slice().reverse().find((l) => l.name.toUpperCase() === customerName.toUpperCase());
+    const isMember = members.some((m) => m.name.toUpperCase() === customerName.toUpperCase());
+
+    setMonthlyForm({
+      firstName: firstName || customerName,
+      lastName: lastName,
+      contact: matchedLog ? (matchedLog.contact || '') : '',
+      classification: isMember ? 'MEMBER' : (matchedLog ? (matchedLog.classification || 'NON-MEMBER') : 'NON-MEMBER'),
+      customerType: matchedLog ? (matchedLog.type || 'REGULAR') : 'REGULAR',
+      dateAdded: new Date().toISOString().split('T')[0],
+      durationMonths: 1,
+      paymentMethod: 'CASH',
+    });
+    setIsMonthlySelected(true);
+    setIsNameLocked(true);
+
+    setActiveModal(null);
+    setPosView('monthly-pass');
+  };
+
+  // PRICING LOGIC
+  const calculateDailyTotal = (water, supplements, passType, customerType, classification, firstName, lastName) => {
+    const fullName = `${firstName} ${lastName}`.trim();
+    if (!fullName) return 0;
     let basePrice = 0;
     if (passType === 'DAILY PASS') {
-      basePrice = customerType === 'STUDENT' ? 75 : 85;
-      if (classification === 'MEMBER') basePrice = Math.max(0, basePrice - 10);
+      basePrice = 100;
+      let discount = 0;
+      if (classification === 'MEMBER') discount += 15;
+      if (customerType === 'STUDENT') discount += 15;
+      basePrice = Math.max(0, basePrice - discount);
     } else if (passType === 'MEMBERSHIP AVAIL') {
       basePrice = 500;
     }
@@ -289,8 +429,13 @@ export default function PointOfSalesPage({
   };
 
   const calculateMonthlyTotal = () => {
-    let monthlyRate = monthlyForm.customerType === 'STUDENT' ? 1000 : 1100;
-    if (monthlyForm.classification === 'MEMBER') monthlyRate = Math.max(0, monthlyRate - 100);
+    if (!monthlyForm.firstName.trim()) return 0;
+    let monthlyRate = 1100;
+    let discount = 0;
+    if (monthlyForm.classification === 'MEMBER') discount += 100;
+    if (monthlyForm.customerType === 'STUDENT') discount += 100;
+    monthlyRate = Math.max(0, monthlyRate - discount);
+
     const months = parseInt(monthlyForm.durationMonths || 1, 10);
     return monthlyRate * months;
   };
@@ -308,54 +453,123 @@ export default function PointOfSalesPage({
     const now = new Date();
     const date = now.toISOString().split('T')[0];
     const time = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
-    return { date, time };
+    return { date, time, fullDateObj: now };
   };
 
   const handleRestrictedAccess = (targetView) => {
     if (!isShiftOpen) {
       setActiveModal('open-shift-first');
     } else {
+      if (targetView === 'avail-membership' || targetView === 'monthly-pass') {
+        setIsNameLocked(false);
+      }
       setPosView(targetView);
     }
   };
 
-  const addCheckIn = (name, type, amount, passType, paymentMethod, classification, water, supplements, durationMonths = 1) => {
+  // Check 2-hour restriction ONLY for regular check-ins
+  const checkIfWithinTwoHours = (name) => {
+    const uppercaseName = name.toUpperCase().trim();
+    const now = new Date();
+
+    const recentLog = checkInLogs.slice().reverse().find((l) => l.name.toUpperCase() === uppercaseName);
+    if (recentLog && recentLog.date && recentLog.time) {
+      const logDateTime = new Date(`${recentLog.date}T${recentLog.time}`);
+      const diffMs = now - logDateTime;
+      const diffHours = diffMs / (1000 * 60 * 60);
+      if (diffHours < 2) {
+        const remainingMinutes = Math.ceil((2 - diffHours) * 60);
+        return { restricted: true, remainingMinutes };
+      }
+    }
+    return { restricted: false };
+  };
+
+  // SAVE OR UPDATE CHECK-IN LOG WITHOUT DUPLICATING CUSTOMERS IN TABLE
+  const saveCheckInLog = (name, type, amount, passType, paymentMethod, classification, water, supplements, durationMonths = 1) => {
     const { date, time } = getCurrentDateTime();
     const suppString = Array.isArray(supplements) && supplements.length > 0 ? supplements.join(', ') : 'NONE';
+    const uppercaseName = name.toUpperCase().trim();
 
-    const newLogEntry = {
-      name: name.toUpperCase(),
-      date,
-      time,
-      type: type || 'REGULAR',
-      amount,
-      passType: passType || 'DAILY PASS',
-      paymentMethod,
-      water: water || 'NO',
-      supplements: suppString,
-      classification: classification || 'NON-MEMBER',
-      durationMonths: durationMonths,
-    };
-    
-    if (onAddCheckInLog) {
-      onAddCheckInLog(newLogEntry);
+    // Check if customer already exists in checkInLogs for this shift
+    const existingIndex = checkInLogs.findIndex((l) => l.name.toUpperCase() === uppercaseName);
+
+    if (existingIndex !== -1) {
+      // Update existing entry instead of adding a new row
+      const existing = checkInLogs[existingIndex];
+      const updatedAmount = (existing.amount || 0) + amount;
+
+      let combinedSupps = existing.supplements;
+      if (suppString !== 'NONE') {
+        const existingSuppList = existing.supplements && existing.supplements !== 'NONE' ? existing.supplements.split(', ') : [];
+        const newSuppList = Array.isArray(supplements) ? supplements : [supplements];
+        const mergedSupps = Array.from(new Set([...existingSuppList, ...newSuppList]));
+        combinedSupps = mergedSupps.length > 0 ? mergedSupps.join(', ') : 'NONE';
+      }
+
+      const updatedWater = existing.water === 'YES' || water === 'YES' ? 'YES' : 'NO';
+      const updatedPassType = passType !== 'DAILY PASS' ? passType : existing.passType;
+
+      checkInLogs[existingIndex] = {
+        ...existing,
+        type: type || existing.type,
+        amount: updatedAmount,
+        passType: updatedPassType,
+        paymentMethod: paymentMethod || existing.paymentMethod,
+        classification: classification || existing.classification,
+        water: updatedWater,
+        supplements: combinedSupps,
+        durationMonths: (existing.durationMonths || 1) + (durationMonths > 1 ? durationMonths - 1 : 0),
+        date,
+        time,
+      };
+    } else {
+      const newLogEntry = {
+        name: uppercaseName,
+        date,
+        time,
+        type: type || 'REGULAR',
+        amount,
+        passType: passType || 'DAILY PASS',
+        paymentMethod,
+        water: water || 'NO',
+        supplements: suppString,
+        classification: classification || 'NON-MEMBER',
+        durationMonths: durationMonths,
+      };
+      
+      if (onAddCheckInLog) {
+        onAddCheckInLog(newLogEntry);
+      }
     }
     setPosView('checkin-log');
   };
 
   const handleCustomerSubmit = (e) => {
     e.preventDefault();
-    if (!customerForm.fullName.trim()) return;
+    if (!customerForm.firstName.trim()) return;
+
+    const fullName = `${customerForm.firstName} ${customerForm.lastName}`.toUpperCase().trim();
+
+    const restriction = checkIfWithinTwoHours(fullName);
+    if (restriction.restricted) {
+      setAlertMessage(`Cannot check in ${fullName} yet! Please wait about ${restriction.remainingMinutes} more minute(s) (2-hour limit per shift).`);
+      setActiveModal('custom-alert');
+      return;
+    }
+
     const finalAmount = calculateDailyTotal(
       customerForm.water, 
       customerForm.supplements, 
       customerForm.passType, 
       customerForm.customerType, 
-      customerForm.classification
+      customerForm.classification,
+      customerForm.firstName,
+      customerForm.lastName
     );
     
-    addCheckIn(
-      customerForm.fullName, 
+    saveCheckInLog(
+      fullName, 
       customerForm.customerType, 
       finalAmount, 
       customerForm.passType, 
@@ -367,7 +581,8 @@ export default function PointOfSalesPage({
     );
 
     setCustomerForm({ 
-      fullName: '', 
+      firstName: '', 
+      lastName: '',
       water: 'NO', 
       supplements: [], 
       classification: 'NON-MEMBER', 
@@ -375,7 +590,7 @@ export default function PointOfSalesPage({
       customerType: 'REGULAR', 
       paymentMethod: 'CASH' 
     });
-    setIsCustomerSelected(false);
+    setIsCustomerSynced(false);
     setIsSuppDropdownOpen(false);
     setSuggestions([]);
   };
@@ -384,9 +599,10 @@ export default function PointOfSalesPage({
     e.preventDefault();
     if (!monthlyForm.firstName.trim()) return;
     const fullName = `${monthlyForm.firstName} ${monthlyForm.lastName}`.toUpperCase();
+    
     const finalAmount = calculateMonthlyTotal();
     
-    addCheckIn(
+    saveCheckInLog(
       fullName,
       monthlyForm.customerType,
       finalAmount,
@@ -409,7 +625,7 @@ export default function PointOfSalesPage({
     const fullName = `${membershipForm.firstName} ${membershipForm.lastName}`.toUpperCase();
     const feeNum = parseFloat(membershipForm.fee) || 500;
     
-    addCheckIn(
+    saveCheckInLog(
       fullName,
       'REGULAR',
       feeNum,
@@ -434,7 +650,6 @@ export default function PointOfSalesPage({
     }
 
     setMembershipForm({ firstName: '', lastName: '', age: '', sex: 'M', contact: '', address: '', dateAdded: new Date().toISOString().split('T')[0], fee: '500.00', paymentMethod: 'CASH' });
-    setIsMembershipSelected(false);
   };
 
   const handleExpenseSubmit = (e) => {
@@ -467,12 +682,18 @@ export default function PointOfSalesPage({
     if (selectedLogIndex === null) return;
 
     const targetLog = checkInLogs[selectedLogIndex];
+    const nameParts = targetLog.name.trim().split(' ');
+    const lName = nameParts.length > 1 ? nameParts.pop() : '';
+    const fName = nameParts.join(' ');
+
     const newAmount = calculateDailyTotal(
       editLogForm.water,
       editLogForm.supplements,
       targetLog.passType,
       targetLog.type,
-      targetLog.classification
+      targetLog.classification,
+      fName,
+      lName
     );
 
     const suppString = editLogForm.supplements.length > 0 ? editLogForm.supplements.join(', ') : 'NONE';
@@ -523,39 +744,53 @@ export default function PointOfSalesPage({
       {posView === 'log-customer' && (
         <ViewCard title="LOG A CUSTOMER" onBack={() => setPosView('menu')}>
           <div className="absolute top-8 right-8 flex gap-2">
-            <button type="button" onClick={() => setPosView('avail-membership')} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
+            <button type="button" onClick={() => { setIsNameLocked(false); setPosView('avail-membership'); }} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
               AVAIL MEMBERSHIP
             </button>
-            <button type="button" onClick={() => setPosView('monthly-pass')} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
+            <button type="button" onClick={() => { setIsNameLocked(false); setPosView('monthly-pass'); }} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
               AVAIL MONTHLY PASS
             </button>
           </div>
 
           <form onSubmit={handleCustomerSubmit} className="space-y-4 pt-2">
-            <div className="relative">
-              <label className="block text-xs font-semibold mb-1">Full Name</label>
-              <input 
-                type="text" 
-                placeholder="Type or search full name" 
-                value={customerForm.fullName} 
-                onChange={(e) => handleNameInputChange(e.target.value)} 
-                required 
-                className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
-              />
-              {suggestions.length > 0 && (
-                <div className="absolute top-full left-0 right-0 bg-[#070a11] border border-amber-400 rounded-lg mt-1 z-30 overflow-hidden shadow-2xl">
-                  {suggestions.map((person, idx) => (
-                    <div
-                      key={idx}
-                      onClick={() => handleSelectCustomer(person)}
-                      className="px-4 py-2 hover:bg-amber-500/20 cursor-pointer text-xs font-bold flex justify-between items-center border-b border-amber-500/10 last:border-0"
-                    >
-                      <span>{person.name}</span>
-                      <span className="text-[10px] text-amber-400 font-mono">[{person.classification} • {person.passType}]</span>
-                    </div>
-                  ))}
-                </div>
-              )}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="relative">
+                <label className="block text-xs font-semibold mb-1">First Name</label>
+                <input 
+                  type="text" 
+                  placeholder="First Name" 
+                  value={customerForm.firstName} 
+                  onChange={(e) => handleCustomerNameInput(e.target.value, true)} 
+                  required 
+                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                />
+                {suggestions.length > 0 && (
+                  <div className="absolute top-full left-0 right-0 bg-[#070a11] border border-amber-400 rounded-lg mt-1 z-30 overflow-hidden shadow-2xl">
+                    {suggestions.map((person, idx) => (
+                      <div
+                        key={idx}
+                        onClick={() => handleSelectCustomer(person)}
+                        className="px-4 py-2 hover:bg-amber-500/20 cursor-pointer text-xs font-bold flex justify-between items-center border-b border-amber-500/10 last:border-0"
+                      >
+                        <span>{person.name}</span>
+                        <span className="text-[10px] text-amber-400 font-mono">[{person.classification} • {person.passType}]</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold mb-1">Last Name</label>
+                <input 
+                  type="text" 
+                  placeholder="Last Name" 
+                  value={customerForm.lastName} 
+                  onChange={(e) => handleCustomerNameInput(e.target.value, false)} 
+                  required 
+                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                />
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
@@ -594,43 +829,52 @@ export default function PointOfSalesPage({
             </div>
 
             <div className="grid grid-cols-2 gap-4">
-              {isCustomerSelected ? (
-                <div>
-                  <label className="block text-xs font-semibold mb-1">Classification (Auto-filled)</label>
-                  <input type="text" readOnly value={customerForm.classification} className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" />
-                </div>
-              ) : (
-                <FormSelect label="Classification" value={customerForm.classification} onChange={(val) => setCustomerForm({ ...customerForm, classification: val })} options={['NON-MEMBER', 'MEMBER']} />
-              )}
+              <div>
+                <label className="block text-xs font-semibold mb-1">Classification (Synced)</label>
+                <input 
+                  type="text" 
+                  readOnly 
+                  value={customerForm.classification} 
+                  className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" 
+                />
+              </div>
 
-              {isCustomerSelected ? (
-                <div>
-                  <label className="block text-xs font-semibold mb-1">Pass Type (Auto-filled)</label>
-                  <input type="text" readOnly value={customerForm.passType} className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" />
-                </div>
-              ) : (
-                <FormSelect label="Pass Type" value={customerForm.passType} onChange={(val) => setCustomerForm({ ...customerForm, passType: val })} options={['DAILY PASS', 'MONTHLY PASS']} />
-              )}
+              <div>
+                <label className="block text-xs font-semibold mb-1">Pass Type (Synced)</label>
+                <input 
+                  type="text" 
+                  readOnly 
+                  value={customerForm.passType} 
+                  className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" 
+                />
+              </div>
             </div>
 
             <div className="grid grid-cols-2 gap-4">
-              {isCustomerSelected ? (
-                <div>
-                  <label className="block text-xs font-semibold mb-1">Customer Type (Auto-filled)</label>
-                  <input type="text" readOnly value={customerForm.customerType} className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" />
-                </div>
-              ) : (
-                <FormSelect 
-                  label="Customer Type" 
-                  value={customerForm.customerType} 
-                  onChange={(val) => setCustomerForm({ ...customerForm, customerType: val })} 
-                  options={['REGULAR', 'STUDENT']} 
-                />
-              )}
+              <div>
+                {isCustomerSynced ? (
+                  <div>
+                    <label className="block text-xs font-semibold mb-1">Customer Type (Synced)</label>
+                    <input 
+                      type="text" 
+                      readOnly 
+                      value={customerForm.customerType} 
+                      className="w-full bg-slate-900/60 border border-amber-500/40 rounded-lg px-4 py-2.5 text-xs text-amber-300 font-bold focus:outline-none cursor-not-allowed" 
+                    />
+                  </div>
+                ) : (
+                  <FormSelect 
+                    label="Customer Type" 
+                    value={customerForm.customerType} 
+                    onChange={(val) => setCustomerForm({ ...customerForm, customerType: val })} 
+                    options={['REGULAR', 'STUDENT']} 
+                  />
+                )}
+              </div>
               <FormSelect label="Payment Method" value={customerForm.paymentMethod} onChange={(val) => setCustomerForm({ ...customerForm, paymentMethod: val })} options={['CASH', 'ONLINE PAYMENT']} />
             </div>
 
-            <FormFooter amount={calculateDailyTotal(customerForm.water, customerForm.supplements, customerForm.passType, customerForm.customerType, customerForm.classification).toFixed(2)} />
+            <FormFooter amount={calculateDailyTotal(customerForm.water, customerForm.supplements, customerForm.passType, customerForm.customerType, customerForm.classification, customerForm.firstName, customerForm.lastName).toFixed(2)} />
           </form>
         </ViewCard>
       )}
@@ -638,19 +882,26 @@ export default function PointOfSalesPage({
       {/* MONTHLY PASS */}
       {posView === 'monthly-pass' && (
         <ViewCard title="MONTHLY PASS" onBack={() => setPosView('log-customer')}>
-          <form onSubmit={handleMonthlySubmit} className="space-y-4">
+          <div className="absolute top-8 right-8">
+            <button type="button" onClick={() => { setIsNameLocked(false); setPosView('avail-membership'); }} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
+              AVAIL MEMBERSHIP
+            </button>
+          </div>
+
+          <form onSubmit={handleMonthlySubmit} className="space-y-4 pt-2">
             <div className="grid grid-cols-2 gap-4">
               <div className="relative">
-                <label className="block text-xs font-semibold mb-1">First Name</label>
+                <label className="block text-xs font-semibold mb-1">First Name {isNameLocked && '(Locked)'}</label>
                 <input 
                   type="text" 
                   value={monthlyForm.firstName} 
                   onChange={(e) => handleMonthlyNameInput(e.target.value, true)} 
                   placeholder="First Name" 
                   required 
-                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                  readOnly={isNameLocked}
+                  className={`w-full border rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none ${isNameLocked ? 'bg-slate-900/60 border-amber-500/40 text-amber-300 cursor-not-allowed' : 'bg-[#070a11] border-amber-500/40 focus:border-amber-400'}`} 
                 />
-                {monthlySuggestions.length > 0 && (
+                {!isNameLocked && monthlySuggestions.length > 0 && (
                   <div className="absolute top-full left-0 right-0 bg-[#070a11] border border-amber-400 rounded-lg mt-1 z-30 overflow-hidden shadow-2xl">
                     {monthlySuggestions.map((person, idx) => (
                       <div
@@ -667,14 +918,15 @@ export default function PointOfSalesPage({
               </div>
 
               <div>
-                <label className="block text-xs font-semibold mb-1">Last Name</label>
+                <label className="block text-xs font-semibold mb-1">Last Name {isNameLocked && '(Locked)'}</label>
                 <input 
                   type="text" 
                   value={monthlyForm.lastName} 
                   onChange={(e) => handleMonthlyNameInput(e.target.value, false)} 
                   placeholder="Last Name" 
                   required 
-                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                  readOnly={isNameLocked}
+                  className={`w-full border rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none ${isNameLocked ? 'bg-slate-900/60 border-amber-500/40 text-amber-300 cursor-not-allowed' : 'bg-[#070a11] border-amber-500/40 focus:border-amber-400'}`} 
                 />
               </div>
             </div>
@@ -726,7 +978,7 @@ export default function PointOfSalesPage({
                   />
                 </div>
               ) : (
-                <FormSelect label="Customer Type" value={monthlyForm.customerType} onChange={(val) => setMonthlyForm({ ...monthlyForm, customerType: val })} options={['REGULAR', 'STUDENT']} />
+                <FormSelect label="Customer Type (-P100 Student Discount)" value={monthlyForm.customerType} onChange={(val) => setMonthlyForm({ ...monthlyForm, customerType: val })} options={['REGULAR', 'STUDENT']} />
               )}
             </div>
 
@@ -746,19 +998,26 @@ export default function PointOfSalesPage({
       {/* AVAIL MEMBERSHIP */}
       {posView === 'avail-membership' && (
         <ViewCard title="AVAIL MEMBERSHIP" onBack={() => setPosView('log-customer')}>
-          <form onSubmit={handleAvailMembershipSubmit} className="space-y-4">
+          <div className="absolute top-8 right-8">
+            <button type="button" onClick={() => { setIsNameLocked(false); setPosView('monthly-pass'); }} className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-3 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">
+              AVAIL MONTHLY PASS
+            </button>
+          </div>
+
+          <form onSubmit={handleAvailMembershipSubmit} className="space-y-4 pt-2">
             <div className="grid grid-cols-2 gap-4">
               <div className="relative">
-                <label className="block text-xs font-semibold mb-1">First Name</label>
+                <label className="block text-xs font-semibold mb-1">First Name {isNameLocked && '(Locked)'}</label>
                 <input 
                   type="text" 
                   value={membershipForm.firstName} 
                   onChange={(e) => handleMembershipNameInput(e.target.value, true)} 
                   placeholder="First Name" 
                   required 
-                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                  readOnly={isNameLocked}
+                  className={`w-full border rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none ${isNameLocked ? 'bg-slate-900/60 border-amber-500/40 text-amber-300 cursor-not-allowed' : 'bg-[#070a11] border-amber-500/40 focus:border-amber-400'}`} 
                 />
-                {membershipSuggestions.length > 0 && (
+                {!isNameLocked && membershipSuggestions.length > 0 && (
                   <div className="absolute top-full left-0 right-0 bg-[#070a11] border border-amber-400 rounded-lg mt-1 z-30 overflow-hidden shadow-2xl">
                     {membershipSuggestions.map((person, idx) => (
                       <div
@@ -775,14 +1034,15 @@ export default function PointOfSalesPage({
               </div>
 
               <div>
-                <label className="block text-xs font-semibold mb-1">Last Name</label>
+                <label className="block text-xs font-semibold mb-1">Last Name {isNameLocked && '(Locked)'}</label>
                 <input 
                   type="text" 
                   value={membershipForm.lastName} 
                   onChange={(e) => handleMembershipNameInput(e.target.value, false)} 
                   placeholder="Last Name" 
                   required 
-                  className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none focus:border-amber-400" 
+                  readOnly={isNameLocked}
+                  className={`w-full border rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:outline-none ${isNameLocked ? 'bg-slate-900/60 border-amber-500/40 text-amber-300 cursor-not-allowed' : 'bg-[#070a11] border-amber-500/40 focus:border-amber-400'}`} 
                 />
               </div>
             </div>
@@ -833,7 +1093,7 @@ export default function PointOfSalesPage({
 
       {/* CHECK-IN LOG TABLE */}
       {posView === 'checkin-log' && (
-        <TableCard title="CHECK-IN LOG" onBack={() => setPosView('menu')} rightBtn="+" onRightBtnClick={() => setPosView('log-customer')}>
+        <TableCard title="CHECK-IN LOG" onBack={() => setPosView('menu')} rightBtn="+" onRightBtnClick={() => { setIsNameLocked(false); setPosView('log-customer'); }}>
           <table className="w-full text-xs">
             <thead>
               <tr className="border-b border-amber-500/40 bg-[#070a11]">
@@ -841,12 +1101,13 @@ export default function PointOfSalesPage({
                 <th className="p-2 border-r border-amber-500/40 font-bold uppercase text-center">CLASSIFICATION</th>
                 <th className="p-2 border-r border-amber-500/40 font-bold uppercase text-center">CLASS TYPE</th>
                 <th className="p-2 border-r border-amber-500/40 font-bold uppercase text-center">PASS TYPE</th>
-                <th className="p-2 font-bold uppercase text-center w-36">DATE AND TIME</th>
+                <th className="p-2 border-r border-amber-500/40 font-bold uppercase text-center w-36">DATE AND TIME</th>
+                <th className="p-2 font-bold uppercase text-center w-24">AMOUNT</th>
               </tr>
             </thead>
             <tbody>
               {checkInLogs.length === 0 ? (
-                <tr><td colSpan="5" className="p-4 text-center text-slate-500 italic">No customer logs for this shift yet.</td></tr>
+                <tr><td colSpan="6" className="p-4 text-center text-slate-500 italic">No customer logs for this shift yet.</td></tr>
               ) : (
                 checkInLogs.map((item, idx) => (
                   <tr key={idx} className="border-b border-amber-500/20 hover:bg-amber-500/10 transition">
@@ -862,7 +1123,8 @@ export default function PointOfSalesPage({
                     <td className="p-2 border-r border-amber-500/20 text-center font-bold text-amber-400">{item.classification || 'NON-MEMBER'}</td>
                     <td className="p-2 border-r border-amber-500/20 text-center font-bold text-slate-200">{item.type || 'REGULAR'}</td>
                     <td className="p-2 border-r border-amber-500/20 text-center font-bold text-amber-300">{item.passType || 'DAILY PASS'}</td>
-                    <td className="p-2 text-center font-mono text-amber-300">{item.date} {item.time}</td>
+                    <td className="p-2 border-r border-amber-500/20 text-center font-mono text-amber-300">{item.date} {item.time}</td>
+                    <td className="p-2 text-center font-mono font-bold text-amber-400">P {(item.amount || 0).toFixed(2)}</td>
                   </tr>
                 ))
               )}
@@ -934,111 +1196,150 @@ export default function PointOfSalesPage({
 
       {/* MODALS */}
       {activeModal && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-xs flex items-center justify-center p-4 z-50">
-          {activeModal === 'open-shift-first' && (
-            <ModalBox title="Open Shift First!" onClose={() => setActiveModal(null)}>
-              <p className="text-xs font-semibold text-slate-200">You must open a shift before accessing sales and customer logs.</p>
-              <div className="flex justify-center pt-2">
-                <button type="button" onClick={() => setActiveModal('open-shift')} className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-6 py-2 rounded-lg cursor-pointer uppercase">OPEN SHIFT NOW</button>
-              </div>
-            </ModalBox>
-          )}
-
-          {activeModal === 'coming-soon' && (
-            <ModalBox title="Coming Soon!" onClose={() => setActiveModal(null)}>
-              <p className="text-xs font-semibold text-slate-200">This feature is currently under development.</p>
-            </ModalBox>
-          )}
-
-          {activeModal === 'open-shift' && (
-            <ModalBox title="OPEN SHIFT" onClose={() => setActiveModal(null)}>
-              <div className="space-y-2">
-                <label className="block text-xs font-extrabold uppercase">ENTER STARTING CASH:</label>
-                <div className="bg-[#4a3b00] border-2 border-amber-400 rounded-xl px-4 py-2">
-                  <input type="text" placeholder="1000.00" value={startingCash} onChange={(e) => setStartingCash(e.target.value.replace(/[^0-9.]/g, ''))} className="w-full bg-transparent text-center font-black text-sm focus:outline-none" />
-                </div>
-              </div>
-              <button type="button" onClick={() => { setIsShiftOpen(true); setActiveModal(null); }} className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT</button>
-            </ModalBox>
-          )}
-
-          {activeModal === 'close-shift' && (
-            <ModalBox title="CLOSE SHIFT" onClose={() => setActiveModal(null)}>
-              <div className="space-y-2">
-                <label className="block text-xs font-extrabold uppercase">ENTER ENDING CASH REMIT:</label>
-                <div className="bg-[#4a3b00] border-2 border-amber-400 rounded-xl px-4 py-2">
-                  <input type="text" defaultValue={`P ${endingCash.toFixed(2)}`} className="w-full bg-transparent text-center font-black text-sm focus:outline-none" />
-                </div>
-              </div>
-              <button type="button" onClick={() => { setIsShiftOpen(false); setActiveModal(null); setExpensesList([]); }} className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT & CLOSE</button>
-            </ModalBox>
-          )}
-
-          {activeModal === 'add-expense' && (
-            <ModalBox title="ADD EXPENSE" onClose={() => setActiveModal(null)}>
-              <form onSubmit={handleExpenseSubmit} className="space-y-3 text-left text-xs font-bold">
-                <FormInput label="DESCRIPTION:" value={newExpense.desc} onChange={(val) => setNewExpense({ ...newExpense, desc: val })} placeholder="e.g. Delivery Water" required />
-                <FormInput label="AMOUNT (PHP):" value={newExpense.amt} onChange={(val) => setNewExpense({ ...newExpense, amt: val })} placeholder="100.00" type="number" required />
+        <div className="fixed inset-0 flex items-center justify-center p-4 z-50 pointer-events-none">
+          <div className="pointer-events-auto">
+            {activeModal === 'custom-alert' && (
+              <ModalBox title="Notice" onClose={() => setActiveModal(null)}>
+                <p className="text-xs font-semibold text-slate-100">{alertMessage}</p>
                 <div className="flex justify-center pt-2">
-                  <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT</button>
+                  <button type="button" onClick={() => setActiveModal(null)} className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">OK</button>
                 </div>
-              </form>
-            </ModalBox>
-          )}
+              </ModalBox>
+            )}
 
-          {activeModal === 'edit-checkin-log' && selectedLogIndex !== null && (
-            <ModalBox title="ADD WATER / SUPPLEMENTS" onClose={() => setActiveModal(null)}>
-              <form onSubmit={handleSaveEditedLog} className="space-y-4 text-left text-xs font-bold">
-                <div className="text-center font-extrabold text-amber-300 text-sm">
-                  {checkInLogs[selectedLogIndex]?.name}
+            {activeModal === 'open-shift-first' && (
+              <ModalBox title="Open Shift First!" onClose={() => setActiveModal(null)}>
+                <p className="text-xs font-semibold text-slate-200">You must open a shift before accessing sales and customer logs.</p>
+                <div className="flex justify-center pt-2">
+                  <button type="button" onClick={() => setActiveModal('open-shift')} className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-6 py-2 rounded-lg cursor-pointer uppercase">OPEN SHIFT NOW</button>
                 </div>
-                
-                <FormSelect 
-                  label="Water (+P15)" 
-                  value={editLogForm.water} 
-                  onChange={(val) => setEditLogForm({ ...editLogForm, water: val })} 
-                  options={['NO', 'YES']} 
-                />
+              </ModalBox>
+            )}
 
-                <div className="relative">
-                  <label className="block text-xs font-semibold mb-1">Supplements (+P50 each)</label>
-                  <div 
-                    onClick={() => setIsEditSuppDropdownOpen(!isEditSuppDropdownOpen)}
-                    className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:border-amber-400 flex justify-between items-center cursor-pointer select-none"
-                  >
-                    <span className="truncate pr-2">
-                      {editLogForm.supplements.length > 0 ? editLogForm.supplements.join(', ') : 'NONE'}
-                    </span>
-                    <span className="text-amber-400 text-xs">▼</span>
-                  </div>
+            {activeModal === 'coming-soon' && (
+              <ModalBox title="Coming Soon!" onClose={() => setActiveModal(null)}>
+                <p className="text-xs font-semibold text-slate-200">This feature is currently under development.</p>
+              </ModalBox>
+            )}
 
-                  {isEditSuppDropdownOpen && (
-                    <div className="absolute top-full left-0 right-0 mt-1 bg-[#070a11] border border-amber-400 rounded-lg shadow-2xl z-40 p-2 max-h-40 overflow-y-auto space-y-1">
-                      {supplementList.map((supp) => {
-                        const isSelected = editLogForm.supplements.includes(supp);
-                        return (
-                          <div
-                            key={supp}
-                            onClick={() => handleToggleSupplement(supp, 'edit')}
-                            className={`flex items-center justify-between px-3 py-2 rounded text-xs font-bold cursor-pointer transition ${isSelected ? 'bg-amber-500/20 text-amber-300' : 'hover:bg-slate-800 text-slate-300'}`}
-                          >
-                            <span>{supp}</span>
-                            <span>{isSelected ? '✓' : ''}</span>
-                          </div>
-                        );
-                      })}
+            {activeModal === 'open-shift' && (
+              <ModalBox title="OPEN SHIFT" onClose={() => setActiveModal(null)}>
+                <form onSubmit={(e) => { e.preventDefault(); setIsShiftOpen(true); setActiveModal(null); }} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-extrabold uppercase">ENTER STARTING CASH:</label>
+                    <div className="bg-[#4a3b00] border-2 border-amber-400 rounded-xl px-4 py-2">
+                      <input 
+                        type="text" 
+                        autoFocus
+                        placeholder="1000.00" 
+                        value={startingCash} 
+                        onChange={(e) => setStartingCash(e.target.value.replace(/[^0-9.]/g, ''))} 
+                        className="w-full bg-transparent text-center font-black text-sm focus:outline-none" 
+                      />
                     </div>
-                  )}
-                </div>
+                  </div>
+                  <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT</button>
+                </form>
+              </ModalBox>
+            )}
 
-                <div className="flex justify-center pt-2">
-                  <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">
-                    UPDATE & SAVE
+            {activeModal === 'close-shift' && (
+              <ModalBox title="CLOSE SHIFT" onClose={() => setActiveModal(null)}>
+                <form onSubmit={(e) => { e.preventDefault(); setIsShiftOpen(false); setActiveModal(null); setExpensesList([]); }} className="space-y-4">
+                  <div className="space-y-2">
+                    <label className="block text-xs font-extrabold uppercase">ENTER ENDING CASH REMIT:</label>
+                    <div className="bg-[#4a3b00] border-2 border-amber-400 rounded-xl px-4 py-2">
+                      <input type="text" defaultValue={`P ${endingCash.toFixed(2)}`} className="w-full bg-transparent text-center font-black text-sm focus:outline-none" />
+                    </div>
+                  </div>
+                  <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT & CLOSE</button>
+                </form>
+              </ModalBox>
+            )}
+
+            {activeModal === 'add-expense' && (
+              <ModalBox title="ADD EXPENSE" onClose={() => setActiveModal(null)}>
+                <form onSubmit={handleExpenseSubmit} className="space-y-3 text-left text-xs font-bold">
+                  <FormInput label="DESCRIPTION:" value={newExpense.desc} onChange={(val) => setNewExpense({ ...newExpense, desc: val })} placeholder="e.g. Delivery Water" required autoFocus />
+                  <FormInput label="AMOUNT (PHP):" value={newExpense.amt} onChange={(val) => setNewExpense({ ...newExpense, amt: val })} placeholder="100.00" type="number" required />
+                  <div className="flex justify-center pt-2">
+                    <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">SUBMIT</button>
+                  </div>
+                </form>
+              </ModalBox>
+            )}
+
+            {activeModal === 'edit-checkin-log' && selectedLogIndex !== null && (
+              <ModalBox title="ADD WATER / SUPPLEMENTS" onClose={() => setActiveModal(null)}>
+                <div className="flex justify-center gap-2 mb-2">
+                  <button 
+                    type="button" 
+                    onClick={() => handleAvailMembershipFromEditModal(checkInLogs[selectedLogIndex]?.name || '')} 
+                    className="border border-amber-400 bg-[#070a11] text-amber-300 text-[10px] font-bold px-3 py-1.5 rounded hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer"
+                  >
+                    AVAIL MEMBERSHIP
+                  </button>
+                  <button 
+                    type="button" 
+                    onClick={() => handleAvailMonthlyPassFromEditModal(checkInLogs[selectedLogIndex]?.name || '')} 
+                    className="border border-amber-400 bg-[#070a11] text-amber-300 text-[10px] font-bold px-3 py-1.5 rounded hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer"
+                  >
+                    AVAIL MONTHLY PASS
                   </button>
                 </div>
-              </form>
-            </ModalBox>
-          )}
+
+                <form onSubmit={handleSaveEditedLog} className="space-y-4 text-left text-xs font-bold">
+                  <div className="text-center font-extrabold text-amber-300 text-sm">
+                    {checkInLogs[selectedLogIndex]?.name}
+                  </div>
+                  
+                  <FormSelect 
+                    label="Water (+P15)" 
+                    value={editLogForm.water} 
+                    onChange={(val) => setEditLogForm({ ...editLogForm, water: val })} 
+                    options={['NO', 'YES']} 
+                  />
+
+                  <div className="relative">
+                    <label className="block text-xs font-semibold mb-1">Supplements (+P50 each)</label>
+                    <div 
+                      onClick={() => setIsEditSuppDropdownOpen(!isEditSuppDropdownOpen)}
+                      className="w-full bg-[#070a11] border border-amber-500/40 rounded-lg px-4 py-2 text-xs font-bold text-slate-100 focus:border-amber-400 flex justify-between items-center cursor-pointer select-none"
+                    >
+                      <span className="truncate pr-2">
+                        {editLogForm.supplements.length > 0 ? editLogForm.supplements.join(', ') : 'NONE'}
+                      </span>
+                      <span className="text-amber-400 text-xs">▼</span>
+                    </div>
+
+                    {isEditSuppDropdownOpen && (
+                      <div className="absolute top-full left-0 right-0 mt-1 bg-[#070a11] border border-amber-400 rounded-lg shadow-2xl z-40 p-2 max-h-40 overflow-y-auto space-y-1">
+                        {supplementList.map((supp) => {
+                          const isSelected = editLogForm.supplements.includes(supp);
+                          return (
+                            <div
+                              key={supp}
+                              onClick={() => handleToggleSupplement(supp, 'edit')}
+                              className={`flex items-center justify-between px-3 py-2 rounded text-xs font-bold cursor-pointer transition ${isSelected ? 'bg-amber-500/20 text-amber-300' : 'hover:bg-slate-800 text-slate-300'}`}
+                            >
+                              <span>{supp}</span>
+                              <span>{isSelected ? '✓' : ''}</span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="flex justify-center pt-2">
+                    <button type="submit" className="bg-[#4a3b00] border border-amber-400 text-xs font-bold px-8 py-2 rounded-lg cursor-pointer uppercase">
+                      UPDATE & SAVE
+                    </button>
+                  </div>
+                </form>
+              </ModalBox>
+            )}
+          </div>
         </div>
       )}
     </div>
@@ -1062,7 +1363,7 @@ function TableCard({ title, onBack, rightBtn, onRightBtnClick, children }) {
       <div className="w-full max-w-4xl bg-[#0b0f19] border border-amber-500/30 rounded-2xl p-6 space-y-4">
         <div className="flex justify-between items-center">
           <button type="button" onClick={onBack} className="text-slate-100 font-extrabold text-lg tracking-wider hover:text-amber-400 cursor-pointer uppercase">‹ {title}</button>
-          {rightBtn && <button type="button" onClick={onRightBtnClick} className="border border-amber-500/60 text-amber-400 text-xs font-bold px-4 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition cursor-pointer uppercase">{rightBtn}</button>}
+          {rightBtn && <button type="button" onClick={onRightBtnClick} className="border border-amber-500/60 text-amber-400 text-xs font-bold px-4 py-2 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">{rightBtn}</button>}
         </div>
         <div className="border border-amber-500/40 rounded-xl overflow-hidden min-h-[160px]">{children}</div>
       </div>
@@ -1070,7 +1371,7 @@ function TableCard({ title, onBack, rightBtn, onRightBtnClick, children }) {
   );
 }
 
-function FormInput({ label, value, onChange, placeholder, type = "text", required, min, max }) {
+function FormInput({ label, value, onChange, placeholder, type = "text", required, min, max, autoFocus }) {
   return (
     <div>
       <label className="block text-xs font-semibold mb-1">{label}</label>
@@ -1078,6 +1379,7 @@ function FormInput({ label, value, onChange, placeholder, type = "text", require
         type={type} 
         min={min}
         max={max}
+        autoFocus={autoFocus}
         placeholder={placeholder} 
         value={value} 
         onChange={(e) => onChange(e.target.value)} 
@@ -1111,7 +1413,7 @@ function FormFooter({ amount, buttonLabel = "SUBMIT" }) {
         <span className="text-sm font-mono text-amber-400">P {amount}</span>
       </div>
       <div className="flex justify-center pt-2">
-        <button type="submit" className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-8 py-2.5 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition cursor-pointer uppercase">{buttonLabel}</button>
+        <button type="submit" className="border border-amber-500/60 bg-[#070a11] text-amber-400 text-xs font-bold px-8 py-2.5 rounded-lg hover:bg-amber-500 hover:text-slate-950 transition uppercase cursor-pointer">{buttonLabel}</button>
       </div>
     </>
   );
